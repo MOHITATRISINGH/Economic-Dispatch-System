@@ -1,0 +1,265 @@
+
+
+import math
+import itertools
+import csv
+import os
+from pyspark.sql import SparkSession
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.regression import LinearRegression, GBTRegressor
+from pyspark.ml.evaluation import RegressionEvaluator
+
+# ----------------------------
+# RBED solver (parameterized)
+# Returns dict with P1..P6, PL, cost, lagr
+# ----------------------------
+def run_rbed(pd=700.0, factor_delp=40.0, factor_A=30.4, debug=False):
+    NG = 6
+    p = factor_A / (factor_delp * factor_delp)
+    ITMAX = 100
+    INMAX = 100
+    a = [0.0, 0.007, 0.005, 0.009, 0.009, 0.008, 0.0075]
+    b = [0.0, 7.0, 10.0, 8.5, 11.0, 10.5, 12.0]
+    c = [0.0, 240.0, 200.0, 220.0, 200.0, 220.0, 120.0]
+    cvp = [0.0, 0.012, 0.04, 0.012, 0.012, 0.012, 0.012]
+    pgmin = [0.0, 100.0, 50.0, 80.0, 50.0, 50.0, 50.0]
+    pgmax = [0.0, 500.0, 200.0, 300.0, 150.0, 200.0, 120.0]
+
+    alpha = 0.005
+    beta = 0.005
+    ep = 0.001
+
+    B = [
+        [0.056, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.00001, 0.00001, 0.00001, 0.00001, 0.00001, 0.00001],
+        [0.0, 0.00001, 0.00003, 0.00001, 0.00001, 0.00001, 0.00001],
+        [0.0, 0.00000, 0.00015, 0.00001, 0.00001, 0.00001, 0.00001],
+        [0.0, 0.00001, 0.00003, 0.00001, 0.00001, 0.00001, 0.00001],
+        [0.0, 0.00015, 0.00001, 0.00001, 0.00001, 0.00001, 0.00001],
+        [0.0, 0.00001, 0.00015, 0.00001, 0.00001, 0.00001, 0.00001]
+    ]
+
+    # initial lagrangian multiplier
+    sum1 = pd
+    sum2 = 0.0
+    for k in range(1, NG + 1):
+        sum1 += b[k] / (2.0 * a[k])
+        sum2 += 1.0 / (2.0 * a[k])
+    lagr = sum1 / sum2
+
+    # prepare pg array [unit][iteration]
+    max_iters = 200
+    pg = [[0.0 for _ in range(max_iters)] for _ in range(NG + 1)]
+
+    # initial pg clamp
+    for k in range(1, NG + 1):
+        pg[k][0] = (lagr - b[k]) / (2.0 * a[k])
+        pg[k][0] = max(min(pg[k][0], pgmax[k]), pgmin[k])
+
+    u = 0.05
+    ep_kt = 56.145
+    OUTMAX = 100
+    final_it = None
+    final_pg = [0.0] * (NG + 1)
+    final_PL = 0.0
+    optimal_total_cost = None
+
+    for out in range(OUTMAX):
+        it = 1
+        while it < ITMAX:
+            # inner iterations
+            for k in range(1, NG + 1):
+                # ensure previous iter is present
+                pg[k][it - 1] = pg[k][it - 1]
+
+            converged = False
+            for inner in range(INMAX):
+                max_diff = 0.0
+                for k in range(1, NG + 1):
+                    sum1 = 0.0
+                    for m in range(1, NG + 1):
+                        sum1 += 2.0 * B[k][m] * pg[m][it - 1]
+                    numerator = (lagr * (1.0 - sum1) - b[k])
+                    denom = 2.0 * (a[k] + (a[k] * cvp[k] * cvp[k]) + (p * cvp[k] * cvp[k]) + (u * cvp[k] * cvp[k]) + (lagr * B[k][k] * (1.0 + cvp[k] * cvp[k])))
+                    if denom == 0:
+                        new_pg = pg[k][it - 1]
+                    else:
+                        new_pg = numerator / denom
+                    new_pg = max(min(new_pg, pgmax[k]), pgmin[k])
+                    pg[k][it] = new_pg
+
+                for k in range(1, NG + 1):
+                    diffk = abs(pg[k][it] - pg[k][it - 1])
+                    if diffk > max_diff:
+                        max_diff = diffk
+
+                if max_diff <= 0.001:
+                    converged = True
+                    break
+                else:
+                    for k in range(1, NG + 1):
+                        pg[k][it - 1] = pg[k][it]
+
+            # compute PL
+            sum1 = B[0][0]
+            for k in range(1, NG + 1):
+                sum1 += (B[k][0] * (pg[k][it] ** 2))
+            sum2 = 0.0
+            for k in range(1, NG + 1):
+                for m in range(1, NG + 1):
+                    sum2 += (pg[k][it] * B[k][m] * pg[m][it])
+            PL = sum1 + sum2
+            sump = sum(pg[k][it] for k in range(1, NG + 1))
+            deltap = (pd + PL - sump)
+
+            if abs(deltap) <= ep:
+                final_it = it
+                final_PL = PL
+                for k in range(1, NG + 1):
+                    final_pg[k] = pg[k][it]
+                optimal_total_cost = sum(a[k] * final_pg[k] ** 2 + b[k] * final_pg[k] + c[k] for k in range(1, NG + 1))
+                break
+
+            lagr = lagr + alpha * deltap
+            it += 1
+
+        # variation check
+        if final_it is not None:
+            Pvals = final_pg
+        else:
+            Pvals = [pg[k][it] for k in range(NG + 1)]
+
+        diff = sum((cvp[k] * cvp[k] * (Pvals[k] ** 2) for k in range(1, NG + 1)))
+        if abs(diff - ep_kt) <= 0.01:
+            break
+        else:
+            u = u - (beta * (ep_kt - diff))
+
+    # prepare result dictionary
+    res = {
+        'pd': pd,
+        'factor_delp': factor_delp,
+        'factor_A': factor_A,
+        'p_risk': p,
+        'PLoss': final_PL,
+        'lagr': lagr,
+        'optimal_total_cost': optimal_total_cost if optimal_total_cost is not None else float('nan'),
+    }
+    for k in range(1, NG + 1):
+        res[f'P{k}'] = float(final_pg[k] if final_pg[k] != 0.0 else pg[k][it])
+    return res
+
+# ----------------------------
+# Generate scenario dataset
+# ----------------------------
+def generate_scenarios(pd_values, factor_delp_values, factor_A=30.4):
+    scenarios = []
+    for pd_v, fdelp in itertools.product(pd_values, factor_delp_values):
+        scenarios.append({'pd': float(pd_v), 'factor_delp': float(fdelp), 'factor_A': float(factor_A)})
+    return scenarios
+
+# ----------------------------
+# Main pipeline
+# ----------------------------
+def main():
+    # 1) Create scenarios
+    pd_values = list(range(600, 751, 5))           # 650, 660, ..., 750
+    factor_delp_values = [30.0, 35.0, 40.0, 45.0]   # different risk delp
+    scenarios = generate_scenarios(pd_values, factor_delp_values)
+
+    # 2) Run RBED for each scenario and collect results
+    results = []
+    print("Running RBED for scenarios (this may take a minute)...")
+    for s in scenarios:
+        r = run_rbed(pd=s['pd'], factor_delp=s['factor_delp'], factor_A=s['factor_A'])
+        # flatten and store
+        row = {
+            'pd': r['pd'],
+            'factor_delp': r['factor_delp'],
+            'factor_A': r['factor_A'],
+            'p_risk': r['p_risk'],
+            'PLoss': r['PLoss'],
+            'lagr': r['lagr'],
+            'optimal_total_cost': r['optimal_total_cost'],
+            'P1': r['P1'],
+            'P2': r['P2'],
+            'P3': r['P3'],
+            'P4': r['P4'],
+            'P5': r['P5'],
+            'P6': r['P6'],
+        }
+        results.append(row)
+
+    # 3) Save results to CSV (local)
+    out_csv = "results.csv"
+    with open(out_csv, 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=list(results[0].keys()))
+        writer.writeheader()
+        for r in results:
+            writer.writerow(r)
+    print(f"Saved {len(results)} scenario results to {out_csv}")
+
+    # 4) Start Spark session
+    spark = SparkSession.builder \
+        .appName("RBED_PySpark_ML") \
+        .master("local[*]") \
+        .getOrCreate()
+
+    # 5) Create Spark DataFrame from results
+    sdf = spark.read.csv(out_csv, header=True, inferSchema=True)
+    print("Sample of Spark DataFrame:")
+    sdf.show(5, truncate=False)
+
+    # 6) Prepare features and train/test split
+    # Example: predict 'optimal_total_cost' from pd, factor_delp, p_risk, PLoss
+    feature_cols_cost = ['pd', 'factor_delp', 'p_risk', 'PLoss']
+    assembler_cost = VectorAssembler(inputCols=feature_cols_cost, outputCol="features_cost")
+    df_cost = assembler_cost.transform(sdf).select('features_cost', 'optimal_total_cost')
+
+    train_cost, test_cost = df_cost.randomSplit([0.8, 0.2], seed=42)
+
+    lr = LinearRegression(featuresCol='features_cost', labelCol='optimal_total_cost')
+    lr_model = lr.fit(train_cost)
+    preds_cost = lr_model.transform(test_cost)
+
+    evaluator_rmse = RegressionEvaluator(labelCol='optimal_total_cost', predictionCol='prediction', metricName='rmse')
+    evaluator_r2 = RegressionEvaluator(labelCol='optimal_total_cost', predictionCol='prediction', metricName='r2')
+    rmse_cost = evaluator_rmse.evaluate(preds_cost)
+    r2_cost = evaluator_r2.evaluate(preds_cost)
+
+    print("LinearRegression for optimal_total_cost - coefficients:", lr_model.coefficients, "intercept:", lr_model.intercept)
+    print(f"Cost model RMSE={rmse_cost:.4f}, R2={r2_cost:.4f}")
+    print("Cost model predictions (sample):")
+    preds_cost.select('prediction', 'optimal_total_cost').show(5, truncate=False)
+
+    # 7) Train a stronger model to predict P1 (example) using GBT
+    feature_cols_p1 = ['pd', 'factor_delp', 'p_risk', 'PLoss']
+    assembler_p1 = VectorAssembler(inputCols=feature_cols_p1, outputCol='features_p1')
+    df_p1 = assembler_p1.transform(sdf).select('features_p1', 'P1')
+
+    train_p1, test_p1 = df_p1.randomSplit([0.8, 0.2], seed=42)
+    gbt = GBTRegressor(featuresCol='features_p1', labelCol='P1', maxIter=50)
+    gbt_model = gbt.fit(train_p1)
+    preds_p1 = gbt_model.transform(test_p1)
+
+    rmse_p1 = evaluator_rmse.evaluate(preds_p1.withColumnRenamed('P1', 'optimal_total_cost')) if False else RegressionEvaluator(labelCol='P1', predictionCol='prediction', metricName='rmse').evaluate(preds_p1)
+    r2_p1 = RegressionEvaluator(labelCol='P1', predictionCol='prediction', metricName='r2').evaluate(preds_p1)
+
+    print(f"GBT model for P1 - RMSE={rmse_p1:.4f}, R2={r2_p1:.4f}")
+    print("P1 model predictions (sample):")
+    preds_p1.select('prediction', 'P1').show(5, truncate=False)
+
+    # 8) Save predictions back to CSV
+    preds_cost_out = preds_cost.select('prediction', 'optimal_total_cost').toPandas()
+    preds_p1_out = preds_p1.select('prediction', 'P1').toPandas()
+
+    preds_cost_out.to_csv('predictions_cost.csv', index=False)
+    preds_p1_out.to_csv('predictions_p1.csv', index=False)
+    print("Saved predictions to predictions_cost.csv and predictions_p1.csv")
+
+    spark.stop()
+    print("Spark session stopped. Done.")
+
+
+if __name__ == '__main__':
+    main()
